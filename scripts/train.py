@@ -66,7 +66,11 @@ def main(cfg_data="configs/data.yaml", cfg_model="configs/model.yaml",
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=train_cfg["lr"], weight_decay=train_cfg["weight_decay"])
+    lr = float(train_cfg["lr"])
+    weight_decay = float(train_cfg["weight_decay"])
+
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, "min", factor=train_cfg["lr_factor"], patience=train_cfg["lr_patience"]
     )
