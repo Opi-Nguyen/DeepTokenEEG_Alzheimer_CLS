@@ -1,0 +1,11 @@
+EEG_data/
+outputs/
+*.pt
+*.pth
+*.log
+*.csv
+*.ckpt
+*.zip
+__pycache__/
+*.egg-info/
+.vscode/
