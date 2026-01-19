@@ -1,0 +1,24 @@
+paths:
+  base_dir: "/mnt/sda1/home/sparc/nqthinh/DeepTokenEEG_Alzheimer_CLS/"
+  raw_root: "/mnt/sda1/home/sparc/nqthinh/DeepTokenEEG_Alzheimer_CLS/EEG_data"
+  cache_dir: "outputs/cache"
+
+signal:
+  fs_std: 500
+  fs_target: 128
+  seg_seconds: 4
+  overlap: 0.5
+  band_name: "alpha"   # delta/theta/alpha/beta/gamma
+
+channels:
+  standard_19:
+    - Fp1 - Fp2 - F7 - F3 - Fz - F4 - F8 - T7 - C3 - Cz - C4 - T8
+    - P7 - P3 - Pz - P4 - P8 - O1 - O2
+
+labels:
+  HC: 0
+  AD: 1
+
+split:
+  ratios: [0.6, 0.2, 0.2]
+  seed: 45
