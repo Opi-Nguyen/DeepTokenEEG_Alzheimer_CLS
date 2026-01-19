@@ -24,6 +24,7 @@ def main(cfg_data="configs/data.yaml", cfg_model="configs/model.yaml",
     model_cfg = load_yaml(cfg_model)["model"]
     train_cfg = load_yaml(cfg_train)["train"]
     exp_run = load_yaml(cfg_exp)["run"]
+    
 
     cache_dir = data["paths"]["cache_dir"]
     band_name = data["signal"]["band_name"]
@@ -45,7 +46,14 @@ def main(cfg_data="configs/data.yaml", cfg_model="configs/model.yaml",
     n_blocks = int(model_cfg["resnet"]["n_blocks"])
     dilations = model_cfg["resnet"]["dilations"]
 
-    run_dir = os.path.join(exp_run["out_dir"], exp_run["name"], f"blocks_{n_blocks}")
+
+    ablation = train_cfg.get("ablation", False)
+    if ablation:
+        ablation_name = f"ablation_{n_blocks}_blocks"
+    else:
+        ablation_name = ""
+        
+    run_dir = os.path.join(exp_run["out_dir"], exp_run["name"], ablation_name, f"blocks_{n_blocks}_dilations_{'_'.join(map(str, dilations))}")
     ensure_dir(run_dir)
 
     if checkpoint_path is None:

@@ -52,8 +52,14 @@ def main(cfg_data="configs/data.yaml", cfg_model="configs/model.yaml",
     num_class = int(model_cfg["num_class"])
     n_blocks = int(model_cfg["resnet"]["n_blocks"])
     dilations = model_cfg["resnet"]["dilations"]
+    ablation = train_cfg["ablation"]
+    
+    if ablation:
+        ablation_name = f"ablation_{n_blocks}_blocks"
+    else:
+        ablation_name = ""
 
-    run_dir = os.path.join(exp_cfg["out_dir"], exp_cfg["name"], f"blocks_{n_blocks}")
+    run_dir = os.path.join(exp_cfg["out_dir"], exp_cfg["name"], ablation_name, f"blocks_{n_blocks}_dilations_{'_'.join(map(str, dilations))}")
     ensure_dir(run_dir)
     best_path = os.path.join(run_dir, "best.pth")
     save_json(os.path.join(run_dir, "config_snapshot.json"), {

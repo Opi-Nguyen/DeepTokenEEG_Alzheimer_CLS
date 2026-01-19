@@ -4,6 +4,6 @@ run:
   save_best: true
 
 ablation:
-  n_blocks_list: [1, 2, 3, 4]
+  n_blocks_list: [1, 2, 3, 4, 5]
   seeds: [45]     # có thể mở rộng
   metric_primary: "subject_f1"

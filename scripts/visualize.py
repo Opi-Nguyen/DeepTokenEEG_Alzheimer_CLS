@@ -46,7 +46,7 @@ def main(cfg_data="configs/data.yaml", cfg_model="configs/model.yaml",
     n_blocks = int(model_cfg["resnet"]["n_blocks"])
     dilations = model_cfg["resnet"]["dilations"]
 
-    run_dir = os.path.join(exp_run["out_dir"], exp_run["name"], f"blocks_{n_blocks}")
+    run_dir = os.path.join(exp_run["out_dir"], exp_run["name"], f"blocks_{n_blocks}_dilations_{'_'.join(map(str, dilations))}")
     ckpt = os.path.join(run_dir, "best.pth")
 
     fig_dir = os.path.join(run_dir, "figures")

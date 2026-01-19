@@ -7,3 +7,4 @@ train:
   lr_patience: 10
   lr_factor: 0.1
   device: "auto"
+  ablation: true
