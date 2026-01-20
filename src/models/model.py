@@ -4,9 +4,9 @@ from .blocks import ResidualBlock1D, Tokenizer
 
 class Model(nn.Module):
     def __init__(self, enc_in: int, num_class: int, d_model: int, dropout: float,
-                 n_blocks: int, dilations):
+                 n_blocks: int, dilations, tokenizer_method= "conv", tokenizer_kernel_size=7):
         super().__init__()
-        self.tokenizer = Tokenizer(enc_in, d_model, method="conv", kernel_size=7)
+        self.tokenizer = Tokenizer(enc_in, d_model, method=tokenizer_method, kernel_size=tokenizer_kernel_size)
 
         # pick dilations for ablation
         dilations = dilations[:n_blocks]

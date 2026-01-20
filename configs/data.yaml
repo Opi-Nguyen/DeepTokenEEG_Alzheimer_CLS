@@ -1,6 +1,6 @@
 paths:
-  base_dir: "/mnt/sda1/home/sparc/nqthinh/DeepTokenEEG_Alzheimer_CLS/"
-  raw_root: "/mnt/sda1/home/sparc/nqthinh/DeepTokenEEG_Alzheimer_CLS/EEG_data"
+  base_dir: "/home/mwc2026/Desktop/rs_tmp/DeepTokenEEG_Alzheimer_CLS/"
+  raw_root: "/home/mwc2026/Desktop/rs_tmp/DeepTokenEEG_Alzheimer_CLS/EEG_data"
   cache_dir: "outputs/cache"
 
 signal:

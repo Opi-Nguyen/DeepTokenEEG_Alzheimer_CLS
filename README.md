@@ -263,7 +263,12 @@ This pipeline generates multiple figure groups:
 Run:
 
 ```bash
-python scripts/visualize.py
+python scripts/visualize.py --scan_root outputs/runs/alpha_swt_resnet --n_sets 8
+#or 
+python scripts/visualize.py --snapshot /path/to/run/config_snapshot.json --samples_per_class 128
+#or
+python scripts/visualize.py --snapshot /path/to/run/config_snapshot.json --heatmaps_per_class 8
+
 ```
 
 Figures saved to:
