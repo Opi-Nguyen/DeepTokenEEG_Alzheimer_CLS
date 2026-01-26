@@ -1,7 +1,7 @@
 paths:
   base_dir: "/home/mwc2026/Desktop/rs_tmp/DeepTokenEEG_Alzheimer_CLS/"
   raw_root: "/home/mwc2026/Desktop/rs_tmp/DeepTokenEEG_Alzheimer_CLS/EEG_data"
-  cache_dir: "outputs/cache"
+  cache_dir: "cache_unified/single/AD-Audiotory/alpha"
 
 signal:
   fs_std: 500
