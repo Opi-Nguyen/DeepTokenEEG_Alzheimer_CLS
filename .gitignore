@@ -9,3 +9,5 @@ outputs/
 __pycache__/
 *.egg-info/
 .vscode/
+
+dataset/

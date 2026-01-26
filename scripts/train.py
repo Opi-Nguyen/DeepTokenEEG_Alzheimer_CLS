@@ -99,3 +99,14 @@ if __name__ == "__main__":
     ap.add_argument("--cfg_exp", default="configs/experiment.yaml")
     args = ap.parse_args()
     main(args.cfg_data, args.cfg_model, args.cfg_train, args.cfg_exp)
+
+
+"""pipeline of implementation:
+1. Load config files
+2. Load data from npz cache
+3. Set for loop
+4. Split data into train, val, test
+5. Create dataloaders
+6. Load parameters and initialize model, loss, optimizer, scheduler
+7. Train model with early stopping and save the best model
+"""
