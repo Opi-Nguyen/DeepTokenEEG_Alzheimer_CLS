@@ -33,7 +33,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from src.utils.io import load_npz, ensure_dir
 from src.models.model import Model
-from src.data.dataset import make_loaders
+from data.old.dataset_v1 import make_loaders
 
 from src.viz.feature_plots import compare_tokenizer_and_preclf
 from src.viz.stage_plots import plot_segment_heatmap

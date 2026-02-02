@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from src.utils.metrics import bootstrap_metrics
-from src.data.dataset import subject_average_probs
+from data.old.dataset_v1 import subject_average_probs
 
 def predict_probs(model, loader, device):
     model.eval()

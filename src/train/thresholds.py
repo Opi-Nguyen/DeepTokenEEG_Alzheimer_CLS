@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from sklearn.metrics import f1_score
-from src.data.dataset import subject_average_probs
+from data.old.dataset_v1 import subject_average_probs
 
 def find_best_segment_threshold(model, val_loader, device):
     model.eval()

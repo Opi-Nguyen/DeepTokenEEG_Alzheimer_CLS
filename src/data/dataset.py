@@ -1,43 +1,41 @@
+# src/data/dataset.py
+from __future__ import annotations
+from typing import Optional, Sequence
 import numpy as np
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 
-def to_torch_dataset(X, y, s):
-    X_t = torch.from_numpy(X).float()
-    y_t = torch.from_numpy(y).long()
-    s_t = torch.from_numpy(s).long()
-    return TensorDataset(X_t, y_t, s_t)
 
-def make_loaders(cache, batch_size, num_workers=0):
-    train_ds = to_torch_dataset(cache["X_train"], cache["y_train"], cache["s_train"])
-    val_ds   = to_torch_dataset(cache["X_val"], cache["y_val"], cache["s_val"])
-    test_ds  = to_torch_dataset(cache["X_test"], cache["y_test"], cache["s_test"])
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    return train_loader, val_loader, test_loader
-
-def subject_average_probs(probs, targets, sids):
+class IndexedEEGDataset(Dataset):
     """
-    probs: (N,) probability for class=1
-    targets: (N,)
-    sids: (N,)
-    returns: y_true_subj, y_prob_subj
+    Hold base arrays (X,y,s,k) and index list to avoid copying.
+    Returns: (x, y, s, k)
     """
-    probs = np.asarray(probs)
-    targets = np.asarray(targets)
-    sids = np.asarray(sids)
+    def __init__(self, X: np.ndarray, y: np.ndarray, s: np.ndarray, k: np.ndarray, indices: Sequence[int]):
+        self.X = X
+        self.y = y
+        self.s = s
+        self.k = k
+        self.indices = np.asarray(indices, dtype=np.int64)
 
-    subj_probs = {}
-    subj_label = {}
-    for p, t, sid in zip(probs, targets, sids):
-        if sid not in subj_probs:
-            subj_probs[sid] = []
-            subj_label[sid] = int(t)
-        subj_probs[sid].append(float(p))
+    def __len__(self):
+        return int(self.indices.size)
 
-    s_list = list(subj_probs.keys())
-    y_true = np.array([subj_label[s] for s in s_list], dtype=int)
-    y_prob = np.array([np.mean(subj_probs[s]) for s in s_list], dtype=float)
-    return y_true, y_prob
+    def __getitem__(self, i: int):
+        idx = int(self.indices[i])
+        x = torch.from_numpy(self.X[idx]).float()
+        y = torch.tensor(int(self.y[idx]), dtype=torch.long)
+        sid = str(self.s[idx])
+        kk = int(self.k[idx]) if self.k is not None else -1
+        return x, y, sid, kk
+
+
+def make_loader(ds: Dataset, batch_size: int, shuffle: bool, num_workers: int = 2):
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
