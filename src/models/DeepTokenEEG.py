@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .blocks import ResidualBlock1D, Tokenizer
+from src.models.layers.blocks import ResidualBlock1D, Tokenizer
 
 class Model(nn.Module):
     def __init__(self, enc_in: int, num_class: int, d_model: int, dropout: float,
