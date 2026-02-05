@@ -1,31 +1,37 @@
+# src/models/Conformer.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.Transformer_EncDec import (
-    Encoder,
-    EncoderLayer,
-)
-from models.layers.Embed import ShallowNetEmbedding
-from layers.SelfAttention_Family import FullAttention, AttentionLayer
-from layers.Embed import DataEmbedding
-import numpy as np
+
+from src.models.layers.Transformer_EncDec import Encoder, EncoderLayer
+from src.models.layers.SelfAttention_Family import FullAttention, AttentionLayer
+from src.models.layers.Embed import ShallowNetEmbedding
 
 
 class Model(nn.Module):
     """
-        EEG-Conformer: https://github.com/eeyhsong/EEG-Conformer
+    EEG-Conformer (supervised-only, pipeline-compatible)
+    Input from pipeline: x = [B, C, T]
+    Output: logits [B, num_class]
     """
+    def __init__(self, cfg, enc_in: int, seq_len: int):
+        super().__init__()
+        self.enc_in = int(enc_in)
+        self.seq_len = int(seq_len)
 
-    def __init__(self, configs):
-        super(Model, self).__init__()
-        self.task_name = configs.task_name
-        self.output_attention = configs.output_attention
-        # Embedding
-        self.enc_embedding = ShallowNetEmbedding(
-            configs.enc_in,
-            configs.d_model,
-            configs.dropout,
-        )
+        d_model = int(cfg.get("d_model", 128))
+        dropout = float(cfg.get("dropout", 0.1))
+        n_heads = int(cfg.get("n_heads", 4))
+        d_ff = int(cfg.get("d_ff", 256))
+        e_layers = int(cfg.get("e_layers", 2))
+        factor = int(cfg.get("factor", 1))
+        activation = str(cfg.get("activation", "gelu"))
+        self.output_attention = bool(cfg.get("output_attention", False))
+        self.num_class = int(cfg["num_class"])
+
+        # Embedding: expects [B, T, C]
+        self.enc_embedding = ShallowNetEmbedding(self.enc_in, d_model, dropout)
+
         # Encoder
         self.encoder = Encoder(
             [
@@ -33,50 +39,50 @@ class Model(nn.Module):
                     AttentionLayer(
                         FullAttention(
                             False,
-                            configs.factor,
-                            attention_dropout=configs.dropout,
-                            output_attention=configs.output_attention,
+                            factor,
+                            attention_dropout=dropout,
+                            output_attention=self.output_attention,
                         ),
-                        configs.d_model,
-                        configs.n_heads,
+                        d_model,
+                        n_heads,
                     ),
-                    configs.d_model,
-                    configs.d_ff,
-                    dropout=configs.dropout,
-                    activation=configs.activation,
+                    d_model,
+                    d_ff,
+                    dropout=dropout,
+                    activation=activation,
                 )
-                for l in range(configs.e_layers)
+                for _ in range(e_layers)
             ],
-            norm_layer=torch.nn.LayerNorm(configs.d_model),
+            norm_layer=nn.LayerNorm(d_model),
         )
 
-        # Decoder
-        if self.task_name == "supervised":
-            self.act = F.gelu
-            self.dropout = nn.Dropout(configs.dropout)
-            self.projection = nn.Linear(
-                configs.d_model * int((configs.seq_len - 28) / 2 + 1),
-                configs.num_class
+        self.act = F.gelu if activation.lower() == "gelu" else F.relu
+        self.dropout = nn.Dropout(dropout)
+
+        # robust: infer in_features automatically
+        self.projection = nn.Linear(d_model, self.num_class)
+
+
+    def forward(self, x):
+        # x: [B, C, T] -> [B, T, C]
+        if x.dim() != 3:
+            raise ValueError(f"Conformer expects 3D tensor, got {tuple(x.shape)}")
+
+        if x.shape[-1] == self.enc_in:
+            # already [B, T, C]
+            x_tc = x
+        elif x.shape[1] == self.enc_in:
+            # [B, C, T] -> [B, T, C]
+            x_tc = x.transpose(1, 2).contiguous()
+        else:
+            raise ValueError(
+                f"Channel mismatch: enc_in={self.enc_in}, got input shape={tuple(x.shape)}"
             )
 
-    def supervised(self, x_enc, x_mark_enc):
-        # Embedding
-        enc_out = self.enc_embedding(x_enc)
-        enc_out, attns = self.encoder(enc_out, attn_mask=None)
+        enc_out = self.enc_embedding(x_tc)   # expects [B, T, C]
+        enc_out, _ = self.encoder(enc_out, attn_mask=None)
 
-        # Output
-        output = self.act(
-            enc_out
-        )  # the output transformer encoder/decoder embeddings don't include non-linearity
-        output = self.dropout(output)
-        output = output.reshape(
-            output.shape[0], -1
-        )  # (batch_size, seq_length * d_model)
-        output = self.projection(output)  # (batch_size, num_classes)
-        return output
-
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name == "supervised":
-            dec_out = self.supervised(x_enc, x_mark_enc)
-            return dec_out  # [B, N]
-        return None
+        out = self.act(enc_out)
+        out = self.dropout(out)
+        out = out.mean(dim=1)          # [B, d_model]  (mean over tokens)
+        return self.projection(out) 

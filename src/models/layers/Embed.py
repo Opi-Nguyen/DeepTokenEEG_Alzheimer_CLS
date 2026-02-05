@@ -253,31 +253,110 @@ class PatchEmbedding(nn.Module):
         x = self.value_embedding(x) + self.position_embedding(x)
         return self.dropout(x), n_vars
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
 
 class ShallowNetEmbedding(nn.Module):
-    def __init__(self, c_in, d_model, dropout):
+    """
+    Robust ShallowNetEmbedding for EEG.
+    Accept x:
+      - [B, C, T]
+      - [B, T, C]
+      - [B, 1, C, T]
+    Internally standardize -> [B, 1, C, T]
+    """
+    def __init__(
+        self,
+        c_in: int,
+        d_model: int,
+        dropout: float,
+        temporal_kernel: int = 25,
+        pool_kernel: int = 4,
+        pool_stride: int = 2,
+    ):
         super().__init__()
+        self.c_in = int(c_in)
+        self.temporal_kernel = int(temporal_kernel)
+        self.pool_kernel = int(pool_kernel)
+        self.pool_stride = int(pool_stride)
 
-        self.shallow_net = nn.Sequential(
-            nn.Conv2d(1, d_model, (1, 25), (1, 1)),
-            nn.Conv2d(d_model, d_model, (c_in, 1), (1, 1)),
-            nn.BatchNorm2d(d_model),
-            nn.ELU(),
-            nn.AvgPool2d((1, 4), (1, 2)),
-            nn.Dropout(dropout),
+        # "same-ish" padding on time dimension so W doesn't collapse
+        pad_w = self.temporal_kernel // 2
+
+        self.conv_time = nn.Conv2d(
+            in_channels=1,
+            out_channels=d_model,
+            kernel_size=(1, self.temporal_kernel),
+            stride=(1, 1),
+            padding=(0, pad_w),
+            bias=True,
+        )
+        self.conv_chan = nn.Conv2d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=(self.c_in, 1),
+            stride=(1, 1),
+            padding=(0, 0),
+            bias=True,
         )
 
-        self.projection = nn.Sequential(
-            nn.Conv2d(d_model, d_model, (1, 1), stride=(1, 1)),
-        )
+        self.bn = nn.BatchNorm2d(d_model)
+        self.act = nn.ELU()
+        self.drop = nn.Dropout(dropout)
 
-    def forward(self, x):  # (batch_size, seq_len, enc_in)
-        x = x.permute(0, 2, 1).unsqueeze(1)  # Shape becomes (B, 1, C, T)
-        x = self.shallow_net(x)
-        x = self.projection(x)
-        # Rearrange the output to match the Transformer input format (B, patch_num, d_model)
-        x = rearrange(x, 'b d h w -> b (h w) d')
-        return x
+        self.projection = nn.Conv2d(d_model, d_model, kernel_size=(1, 1), stride=(1, 1))
+
+        self._printed = False  # debug once if you want
+
+    def _to_B1CT(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 4:
+            # [B,1,C,T]
+            if x.shape[1] != 1 or x.shape[2] != self.c_in:
+                raise ValueError(f"Expected [B,1,{self.c_in},T], got {tuple(x.shape)}")
+            return x
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected 3D/4D input, got dim={x.dim()} shape={tuple(x.shape)}")
+
+        # [B,T,C]
+        if x.shape[-1] == self.c_in:
+            return x.permute(0, 2, 1).unsqueeze(1)  # -> [B,1,C,T]
+        # [B,C,T]
+        if x.shape[1] == self.c_in:
+            return x.unsqueeze(1)                   # -> [B,1,C,T]
+
+        raise ValueError(f"Channel mismatch: c_in={self.c_in}, got input shape={tuple(x.shape)}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x2 = self._to_B1CT(x)  # [B,1,C,T]
+
+        # Optional debug (bật nếu cần):
+        # if not self._printed:
+        #     print("DEBUG ShallowNetEmbedding input:", tuple(x2.shape))
+        #     self._printed = True
+
+        x2 = self.conv_time(x2)   # [B,d_model,C,W]
+        x2 = self.conv_chan(x2)   # [B,d_model,1,W]
+        x2 = self.bn(x2)
+        x2 = self.act(x2)
+
+        # Safe pooling on time dimension (W)
+        W = int(x2.shape[-1])
+        if W >= self.pool_kernel:
+            x2 = F.avg_pool2d(x2, kernel_size=(1, self.pool_kernel), stride=(1, self.pool_stride))
+        else:
+            # fallback: keep at least 1 token
+            x2 = F.adaptive_avg_pool2d(x2, output_size=(1, 1))
+
+        x2 = self.drop(x2)
+        x2 = self.projection(x2)
+
+        # [B, d_model, 1, W'] -> [B, W', d_model]
+        x2 = rearrange(x2, "b d h w -> b (h w) d")
+        return x2
+
 
 
 class EEG2RepEmbedding(nn.Module):
@@ -461,6 +540,8 @@ class BIOTEmbedding(nn.Module):
         augmentation=["none"],
     ):
         super().__init__()
+        self.enc_in = int(enc_in)
+        self.seq_len = int(seq_len)
         # Patching
         self.patch_len = patch_len
         self.stride = stride
@@ -482,18 +563,50 @@ class BIOTEmbedding(nn.Module):
                     m.weight, mode="fan_in", nonlinearity="leaky_relu"
                 )
 
-    def forward(self, x):  # (batch_size, seq_len, enc_in)
-        x = x.permute(0, 2, 1)  # (batch_size, enc_in, seq_len)
-        # do patching
-        batch_size, enc_in, _ = x.shape
-        aug_idx = random.randint(0, len(self.augmentation) - 1)
-        x = self.augmentation[aug_idx](x)
-        x = x + self.channel_embedding
-        x = self.padding(x)
-        x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        x = rearrange(x, 'b e n l -> (b e) n l')  # (batch_size * enc_in, patch_num, patch_len)
-        # x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
-        # Input encoding
-        x = self.value_embedding(x) + self.position_embedding(x)  # (batch_size * enc_in, patch_num, d_model)
-        x = rearrange(x, '(b e) n d -> b (e n) d', e=enc_in)  # (batch_size, enc_in * patch_num, d_model)
-        return x + self.segment_embedding
+    def forward(self, x):
+        """
+        Accept:
+        - x: [B, T, C]
+        - x: [B, C, T]
+        Standardize -> x_ct: [B, C, T] with T == self.seq_len
+        """
+        if x.dim() != 3:
+            raise ValueError(f"BIOTEmbedding expects 3D input, got {tuple(x.shape)}")
+
+        C = int(self.enc_in)
+        T0 = int(self.seq_len)
+
+        # --- normalize to [B, C, T] ---
+        if x.shape[1] == C:
+            # already [B, C, T]
+            x_ct = x
+        elif x.shape[-1] == C:
+            # [B, T, C] -> [B, C, T]
+            x_ct = x.permute(0, 2, 1).contiguous()
+        else:
+            raise ValueError(f"Channel mismatch: enc_in={C}, got {tuple(x.shape)}")
+
+        # --- enforce T == self.seq_len (segment_embedding/channel_embedding depend on this) ---
+        T = int(x_ct.shape[-1])
+        if T < T0:
+            # pad right to T0 (replicate last value)
+            x_ct = F.pad(x_ct, (0, T0 - T), mode="replicate")
+        elif T > T0:
+            x_ct = x_ct[..., :T0].contiguous()
+
+        # --- augmentation: ONLY in training ---
+        if self.training and len(self.augmentation) > 0:
+            aug_idx = random.randint(0, len(self.augmentation) - 1)
+            x_ct = self.augmentation[aug_idx](x_ct)
+
+        # --- add channel embedding (broadcast) ---
+        x_ct = x_ct + self.channel_embedding  # [B, C, T0]
+
+        # keep original patching pipeline (expects [B,C,T])
+        x_ct = self.padding(x_ct)  # (0, stride)
+        x_ct = x_ct.unfold(dimension=-1, size=self.patch_len, step=self.stride)  # [B,C,patch_num,patch_len]
+        x_ct = rearrange(x_ct, "b e n l -> (b e) n l")  # [B*C, patch_num, patch_len]
+
+        x_ct = self.value_embedding(x_ct) + self.position_embedding(x_ct)  # [B*C, patch_num, d_model]
+        x_ct = rearrange(x_ct, "(b e) n d -> b (e n) d", e=C)              # [B, C*patch_num, d_model]
+        return x_ct + self.segment_embedding

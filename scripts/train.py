@@ -1,374 +1,449 @@
-# scripts/train.py
+## script/train_cv.py
+from __future__ import annotations
+
 import os
-import copy
-import yaml
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 
-from src.utils.seed import seed_everything
-from src.utils.io import load_json, load_npz, ensure_dir, save_json
-from src.data.dataset import IndexedEEGDataset, make_loader
-from src.data.split import split_by_dataset_then_merge
-from src.models.model import Model
-from src.train.trainer import train_model
+import matplotlib.pyplot as plt
 
-"""
-Train one model (model1 - model 2 - ...)
+from src.utils.config_loader import load_config, resolve_band_paths
+from src.data.npz_dataloader import load_band_npz, EEGSegmentDataset, make_loader
+from src.data.subject_cv import make_subject_folds, split_fold_rotate_60202, indices_for_subjects
+from src.train.metrics import compute_metrics, confusion_2x2
+from src.train.trainer import Trainer
+from src.models.build_model import build_model
 
-python -m scripts.train --cfg_data configs/data.yaml --cfg_model configs/model1.yaml --cfg_train configs/train.yaml --cfg_exp configs/experiment.yaml
+# ------------------
+# IO helpers
+# ------------------
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
-Train all model 
+def save_json(path: str, obj: Dict[str, Any]) -> None:
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-python -m scripts.train --cfg_data configs/data.yaml --cfg_models configs/model1.yaml configs/model2.yaml configs/model3.yaml configs/model4.yaml configs/model5.yaml --cfg_train configs/train.yaml --cfg_exp configs/experiment.yaml
-
-"""
-
-def load_yaml(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def pick_device(train_cfg):
-    dev = train_cfg.get("device", "auto")
-    if dev == "auto":
-        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    return torch.device(dev)
+def save_npz(path: str, **kwargs) -> None:
+    ensure_dir(os.path.dirname(path))
+    np.savez_compressed(path, **kwargs)
 
 
-def _load_cache_from_band_dir(cache_dir: str, band_name: str):
-    npz_path = os.path.join(cache_dir, f"{band_name}.npz")
-    json_path = os.path.join(cache_dir, f"{band_name}.json")
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"Missing NPZ: {npz_path}")
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"Missing sidecar JSON: {json_path}")
-    cache = load_npz(npz_path)
-    meta = load_json(json_path)
-    cache_dict = {k: cache[k] for k in cache.files}
-    return cache_dict, meta, npz_path, json_path
-
-
-def _build_segment_index_by_subject(s: np.ndarray):
-    mp = {}
-    for i, uid in enumerate(s.tolist()):
-        mp.setdefault(uid, []).append(i)
-    return mp
-
-
-def _infer_dataset_from_uid(uid: str) -> str:
-    return uid.split(":", 1)[0] if ":" in uid else "single"
-
-
-def _normalize_subject_index(subject_index: list):
-    # ensure each item has dataset field
-    out = []
-    for it in subject_index:
-        it2 = dict(it)
-        uid = str(it2.get("uid", ""))
-        if "dataset" not in it2 or not it2["dataset"]:
-            it2["dataset"] = _infer_dataset_from_uid(uid)
-        out.append(it2)
-    return out
-
-
-def _filter_only_hc_ad_and_remap(y, subject_index, cfg_labels):
+def standardize_X_to_NTC(X: np.ndarray, max_channels: int = 64) -> tuple[np.ndarray, int]:
     """
-    Enforce ONLY HC/AD and map to cfg: HC=0, AD=1 by default.
-    Preprocessing sidecar already should be HC=0 AD=1, nhưng vẫn check để tránh lỗi CUDA assert.
+    Ensure X is [N, T, C]. Return (X_ntc, enc_in=C).
+    Heuristic: channel dimension usually <= max_channels, time dimension usually larger.
     """
-    hc_id = int(cfg_labels.get("HC", 0))
-    ad_id = int(cfg_labels.get("AD", 1))
-    allowed = {hc_id, ad_id}
+    if X.ndim != 3:
+        raise ValueError(f"Expected X.ndim==3, got shape={X.shape}")
 
-    # subject_index filter
-    kept_uids = set()
-    new_subject_index = []
-    for it in subject_index:
-        lb = int(it.get("label", -999))
-        if lb in allowed:
-            new_subject_index.append(it)
-            kept_uids.add(str(it["uid"]))
+    a, b = X.shape[1], X.shape[2]  # could be (T,C) or (C,T)
 
-    # segment-level filter: keep only y in allowed (an toàn)
-    y = np.asarray(y, dtype=np.int32)
-    keep_seg = np.isin(y, np.array(sorted(list(allowed)), dtype=np.int32))
-    return keep_seg, new_subject_index, kept_uids
+    # case 1: already [N, T, C]
+    if b <= max_channels and a > b:
+        return X, int(b)
 
+    # case 2: [N, C, T] -> transpose to [N, T, C]
+    if a <= max_channels and b > a:
+        X = np.transpose(X, (0, 2, 1))
+        return X, int(a)
 
-def _derive_tags_from_cache_dir(cache_dir: str):
-    # expected .../single/<DATASET>/<BAND>
-    band = os.path.basename(cache_dir.rstrip("/"))
-    parent = os.path.basename(os.path.dirname(cache_dir.rstrip("/")))
-    # scope
-    scope = "single" if ("/single/" in cache_dir.replace("\\", "/")) else ("multidataset" if ("/multidataset/" in cache_dir.replace("\\", "/")) else "cache")
-    dataset_tag = parent if scope == "single" else "multidataset"
-    return scope, dataset_tag, band
+    # fallback: assume last dim is channels
+    return X, int(b)
 
 
-def _iter_model_paths(cfg_model: str, cfg_models: list | None):
-    if cfg_models and len(cfg_models) > 0:
-        return cfg_models
-    return [cfg_model]
+# ------------------
+# Visualize
+# ------------------
+def plot_loss_curve(history: List[Dict[str, Any]], out_path: str) -> None:
+    if not history:
+        return
+    epochs = [h["epoch"] for h in history]
+    tr = [h["train_loss"] for h in history]
+    va = [h["val_loss"] for h in history]
+
+    plt.figure()
+    plt.plot(epochs, tr, label="train_loss")
+    plt.plot(epochs, va, label="val_loss")
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.legend()
+    ensure_dir(os.path.dirname(out_path))
+    plt.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close()
+
+def plot_confusion(cm: np.ndarray, out_path: str, title: str) -> None:
+    plt.figure()
+    plt.imshow(cm, interpolation="nearest")
+    plt.title(title)
+    plt.xlabel("pred")
+    plt.ylabel("true")
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, str(int(cm[i, j])), ha="center", va="center")
+    ensure_dir(os.path.dirname(out_path))
+    plt.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close()
+
+def plot_roc(y_true: np.ndarray, y_prob: np.ndarray, out_path: str, title: str) -> None:
+    y_true = np.asarray(y_true).astype(np.int64)
+    y_prob = np.asarray(y_prob, dtype=float)
+    # simple ROC points
+    thr = np.unique(y_prob)[::-1]
+    tpr, fpr = [], []
+    P = max(int((y_true == 1).sum()), 1)
+    N = max(int((y_true == 0).sum()), 1)
+    for t in thr:
+        y_pred = (y_prob >= t).astype(np.int64)
+        tp = int(((y_true == 1) & (y_pred == 1)).sum())
+        fp = int(((y_true == 0) & (y_pred == 1)).sum())
+        tpr.append(tp / P)
+        fpr.append(fp / N)
+
+    plt.figure()
+    plt.plot(fpr, tpr)
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.title(title)
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    ensure_dir(os.path.dirname(out_path))
+    plt.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close()
 
 
-def run_one(
-    *,
-    data_cfg: dict,
-    train_cfg: dict,
-    exp_cfg: dict,
-    model_yaml_path: str,
-    model_base_cfg: dict,
-    sidecar: dict,
-    cache_dict: dict,
-    npz_path: str,
-    json_path: str,
-    seed: int,
-    n_blocks_override: int | None,
-):
-    # ---------- load arrays ----------
-    band_name = str(data_cfg["signal"]["band_name"])
-    X_key = f"X_{band_name}"
-    if X_key not in cache_dict:
-        raise KeyError(f"NPZ missing key {X_key}. Available keys={list(cache_dict.keys())}")
+# ------------------
+# Eval
+# ------------------
+@torch.no_grad()
+def predict_probs(model: nn.Module, loader, device: torch.device) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return:
+      y_true (N,)
+      y_prob_pos (N,)  probability of class 1
+      sid (N,)  subject id per segment
+    """
+    model.eval()
+    ys, ps, sids = [], [], []
 
-    X = cache_dict[X_key]
-    y = cache_dict["y"]
-    s = cache_dict["s"].astype(str)
-    k = cache_dict.get("k", None)
+    for batch in loader:
+        x, y, sid = batch
+        x = x.to(device, non_blocking=True)
+        logits = model(x)
+        prob = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
 
-    # ---------- subject_index ----------
-    subject_index = sidecar.get("subject_index", [])
-    subject_index = _normalize_subject_index(subject_index)
+        ys.append(y.detach().cpu().numpy())
+        ps.append(prob)
+        sids.extend(list(sid))
 
-    cfg_labels = data_cfg.get("labels", {"HC": 0, "AD": 1})
-    keep_seg_mask, subject_index, kept_uids = _filter_only_hc_ad_and_remap(y, subject_index, cfg_labels)
-
-    X = X[keep_seg_mask]
-    y = np.asarray(y[keep_seg_mask], dtype=np.int32)
-    s = s[keep_seg_mask]
-    if k is not None:
-        k = k[keep_seg_mask]
-
-    # ---------- label sanity ----------
-    num_class = int(model_base_cfg["num_class"])
-    uniq = sorted(set(int(v) for v in y.tolist()))
-    bad = [v for v in uniq if v < 0 or v >= num_class]
-    if bad:
-        raise RuntimeError(f"Invalid labels found {bad} with num_class={num_class}. Check labels in cache/config.")
-
-    # ---------- split subjects ----------
-    ratios = tuple(float(x) for x in data_cfg["split"]["ratios"])
-    split_pack = split_by_dataset_then_merge(
-        subject_index=subject_index,
-        ratios=ratios,
-        seed=int(seed),
-        allowed_labels=tuple(sorted(set(uniq))),
-    )
-    splits = split_pack["splits"]
-    per_dataset = split_pack["per_dataset"]
-
-    # compute all_uids and test_uids as remaining (đúng yêu cầu “trừ ids đã dùng”)
-    all_uids = sorted(list({str(it["uid"]) for it in subject_index}))
-    used_trainval = set(splits["train_uids"]) | set(splits["val_uids"])
-    test_uids = sorted([u for u in all_uids if u not in used_trainval])
-    splits = dict(splits)
-    splits["test_uids"] = test_uids
-
-    uid2idx = _build_segment_index_by_subject(s)
-
-    def collect_indices(uids):
-        out = []
-        for uid in uids:
-            out.extend(uid2idx.get(uid, []))
-        return np.asarray(out, dtype=np.int64)
-
-    train_idx = collect_indices(splits["train_uids"])
-    val_idx = collect_indices(splits["val_uids"])
-    test_idx = collect_indices(splits["test_uids"])
-
-    # ---------- loaders ----------
-    batch_size = int(train_cfg["batch_size"])
-    train_ds = IndexedEEGDataset(X, y, s, k, train_idx)
-    val_ds = IndexedEEGDataset(X, y, s, k, val_idx)
-
-    train_loader = make_loader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = make_loader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    device = pick_device(train_cfg)
-
-    # ---------- effective model cfg (override n_blocks if requested) ----------
-    model_cfg = copy.deepcopy(model_base_cfg)
-    if n_blocks_override is not None:
-        model_cfg["resnet"]["n_blocks"] = int(n_blocks_override)
-
-    n_blocks = int(model_cfg["resnet"]["n_blocks"])
-    dilations = model_cfg["resnet"]["dilations"]
-    model_tag = os.path.splitext(os.path.basename(model_yaml_path))[0]
-
-    cache_dir = data_cfg["paths"]["cache_dir"]
-    scope, dataset_tag, band_tag = _derive_tags_from_cache_dir(cache_dir)
-
-    run_dir = os.path.join(
-        exp_cfg["out_dir"],
-        exp_cfg["name"],
-        scope,
-        dataset_tag,
-        band_tag,
-        model_tag,
-        f"seed_{seed}",
-        f"blocks_{n_blocks}_dilations_{'_'.join(map(str, dilations))}",
-    )
-    ensure_dir(run_dir)
-
-    best_path = os.path.join(run_dir, "best.pth")
-
-    # ---------- save splits + snapshot (eval đọc dùng chung) ----------
-    save_json(os.path.join(run_dir, "splits_subject.json"), {
-        "cache": {"npz": npz_path, "json": json_path, "cache_dir": cache_dir, "band": band_name},
-        "labels_cfg": cfg_labels,
-        "num_class": num_class,
-        "split": {"ratios": ratios, "seed": int(seed)},
-        "all_uids": all_uids,
-        "splits": splits,
-        "per_dataset": per_dataset,
-        "counts": {
-            "subjects_total": len(all_uids),
-            "subjects_train": len(splits["train_uids"]),
-            "subjects_val": len(splits["val_uids"]),
-            "subjects_test": len(splits["test_uids"]),
-            "segments_train": int(train_idx.size),
-            "segments_val": int(val_idx.size),
-            "segments_test": int(test_idx.size),
-        },
-    })
-
-    save_json(os.path.join(run_dir, "config_snapshot.json"), {
-        "data": data_cfg,
-        "train": train_cfg,
-        "experiment": exp_cfg,
-        "model_effective": model_cfg,
-        "model_yaml": model_yaml_path,
-        "sidecar": {
-            "channels_19": sidecar.get("channels_19", None),
-            "label_policy": sidecar.get("label_policy", None),
-            "signal": sidecar.get("signal", None),
-        },
-    })
-
-    # ---------- init model ----------
-    enc_in = len(sidecar.get("channels_19", [])) or 19
-    model = Model(
-        enc_in=int(enc_in),
-        num_class=int(num_class),
-        d_model=int(model_cfg["d_model"]),
-        dropout=float(model_cfg["dropout"]),
-        n_blocks=int(model_cfg["resnet"]["n_blocks"]),
-        dilations=model_cfg["resnet"]["dilations"],
-    ).to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=float(train_cfg["lr"]),
-        weight_decay=float(train_cfg["weight_decay"]),
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, "min",
-        factor=float(train_cfg["lr_factor"]),
-        patience=int(train_cfg["lr_patience"]),
-    )
-
-    # optional training log yaml
-    log_yaml_path = os.path.join(run_dir, "train_log.yaml")
-
-    model, best_val_loss = train_model(
-        model,
-        train_loader,
-        val_loader,
-        criterion,
-        optimizer,
-        scheduler,
-        device=device,
-        epochs=int(train_cfg["epochs"]),
-        patience=int(train_cfg["patience"]),
-        best_model_path=best_path,
-        log_yaml_path=log_yaml_path,
-        run_info={"run_dir": run_dir, "model_tag": model_tag, "seed": int(seed)},
-    )
-
-    save_json(os.path.join(run_dir, "train_summary.json"), {
-        "best_val_loss": float(best_val_loss),
-        "best_ckpt": best_path,
-        "device": str(device),
-    })
+    y_true = np.concatenate(ys, axis=0).astype(np.int64) if ys else np.array([], dtype=np.int64)
+    y_prob = np.concatenate(ps, axis=0).astype(float) if ps else np.array([], dtype=float)
+    sid_arr = np.asarray(sids)
+    return y_true, y_prob, sid_arr
 
 
-def main(cfg_data="configs/data.yaml", cfg_model="configs/model.yaml",
-         cfg_train="configs/train.yaml", cfg_exp="configs/experiment.yaml",
-         cfg_models=None):
+def aggregate_subject(y_true_seg: np.ndarray, y_prob_seg: np.ndarray, sid: np.ndarray, agg: str, threshold: float):
+    """
+    Produce subject-level (y_true_sub, y_prob_sub)
+    """
+    sid = np.asarray(sid)
+    y_true_seg = np.asarray(y_true_seg).astype(np.int64)
+    y_prob_seg = np.asarray(y_prob_seg, dtype=float)
 
-    data_cfg = load_yaml(cfg_data)
-    train_cfg = load_yaml(cfg_train)["train"]
-    exp_all = load_yaml(cfg_exp)
-    exp_cfg = exp_all["run"]
-    ab_cfg = exp_all.get("ablation", {})
+    subj_ids = np.unique(sid)
+    y_true_sub, y_prob_sub = [], []
 
-    band_name = data_cfg["signal"]["band_name"]
-    cache_dir = data_cfg["paths"]["cache_dir"]
-    cache_dict, sidecar, npz_path, json_path = _load_cache_from_band_dir(cache_dir, band_name)
+    for s in subj_ids:
+        idx = np.where(sid == s)[0]
+        # subject label: majority from segments
+        lbs = y_true_seg[idx]
+        c0 = int((lbs == 0).sum())
+        c1 = int((lbs == 1).sum())
+        ysub = 1 if c1 >= c0 else 0
 
-    model_paths = _iter_model_paths(cfg_model, cfg_models)
+        probs = y_prob_seg[idx]
+        if agg == "vote":
+            yhat = (probs >= threshold).astype(np.int64)
+            psub = float(yhat.mean())  # vote-rate
+        else:
+            psub = float(probs.mean())
 
-    seeds = ab_cfg.get("seeds", [int(data_cfg["split"]["seed"])])
-    n_blocks_list = ab_cfg.get("n_blocks_list", None)
-    do_ablation = bool(train_cfg.get("ablation", False)) and (n_blocks_list is not None)
+        y_true_sub.append(ysub)
+        y_prob_sub.append(psub)
 
-    for model_yaml_path in model_paths:
-        model_base_cfg = load_yaml(model_yaml_path)["model"]
+    return np.asarray(y_true_sub, dtype=np.int64), np.asarray(y_prob_sub, dtype=float), subj_ids
 
-        for seed in seeds:
-            seed_everything(int(seed))
 
-            if do_ablation:
-                for nb in n_blocks_list:
-                    run_one(
-                        data_cfg=data_cfg,
-                        train_cfg=train_cfg,
-                        exp_cfg=exp_cfg,
-                        model_yaml_path=model_yaml_path,
-                        model_base_cfg=model_base_cfg,
-                        sidecar=sidecar,
-                        cache_dict=cache_dict,
-                        npz_path=npz_path,
-                        json_path=json_path,
-                        seed=int(seed),
-                        n_blocks_override=int(nb),
+
+def make_optimizer(cfg: Dict[str, Any], model: nn.Module):
+    opt = cfg.get("optimizer", "adamw")
+    lr = float(cfg["lr"])
+    wd = float(cfg["weight_decay"])
+    if opt == "adam":
+        return optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    if opt == "adamw":
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    if opt == "sgd":
+        return optim.SGD(model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
+    raise ValueError(f"Unknown optimizer: {opt}")
+
+
+def make_scheduler(cfg: Dict[str, Any], optimizer):
+    sch = cfg.get("scheduler", "cosine")
+    if sch == "none":
+        return None
+    if sch == "cosine":
+        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(cfg["epochs"]))
+    if sch == "step":
+        return optim.lr_scheduler.StepLR(optimizer, step_size=max(int(cfg["epochs"]) // 3, 1), gamma=0.1)
+    return None
+
+
+def main():
+    cfg = load_config()
+
+    device = torch.device(cfg["device"] if cfg["device"] != "auto" else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = bool(cfg.get("cudnn_benchmark", True))
+        torch.backends.cudnn.deterministic = bool(cfg.get("cuda_deterministic", False))
+
+    # root_run = os.path.join(cfg["outdir"], cfg["model_name"], cfg["run_name"])
+    if cfg["scope"] == "single":
+        root_run = os.path.join(cfg["outdir"], cfg["model_name"], cfg["dataset"])
+    else:
+        root_run = os.path.join(cfg["outdir"], cfg["model_name"], "multi_dataset")
+    
+    ensure_dir(root_run)
+
+    # wandb (optional)
+    wandb_run = None
+    if cfg.get("wandb_mode", "online") != "disabled":
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=cfg.get("wandb_project", "DeepTokenEEG"),
+                entity=cfg.get("wandb_entity", None),
+                name=f"{cfg['run_name']}",
+                config=cfg,
+                dir=root_run,
+                mode=cfg.get("wandb_mode", "online"),
+            )
+        except Exception as e:
+            print(f"[WARN] wandb init failed -> disabled. err={e}")
+            wandb_run = None
+
+    all_band_summaries = {}
+
+    for band in cfg["band_set"]:
+        band_paths = resolve_band_paths(cfg, band)
+        cache = load_band_npz(band_paths["npz"], band)
+
+        X, y, sid = cache.X, cache.y, cache.sid
+        enc_in = int(X.shape[1])
+        seq_len = int(X.shape[2])
+        print("DEBUG X:", X.shape, "enc_in:", enc_in, "seq_len:", seq_len)
+
+        enc_in = int(X.shape[-1]) if X.ndim == 3 else 19
+
+        # subject folds
+        folds = make_subject_folds(
+            y=y,
+            sid=sid,
+            n_folds=int(cfg["folds"]),
+            seed=int(cfg["split_seed"]),
+            stratify=bool(cfg.get("stratify", True)),
+        )
+
+        band_dir = os.path.join(root_run, band)
+        ensure_dir(band_dir)
+
+        fold_metrics_seg = []
+        fold_metrics_sub = []
+
+        for fold_idx in range(int(cfg["folds"])):
+            train_sub, val_sub, test_sub = split_fold_rotate_60202(folds, fold_idx)
+
+            train_idx = indices_for_subjects(sid, train_sub)
+            val_idx = indices_for_subjects(sid, val_sub)
+            test_idx = indices_for_subjects(sid, test_sub)
+
+            fold_dir = os.path.join(band_dir, f"fold_{fold_idx}")
+            ensure_dir(fold_dir)
+
+            # datasets/loaders
+            train_ds = EEGSegmentDataset(X, y, sid, train_idx)
+            val_ds = EEGSegmentDataset(X, y, sid, val_idx)
+            test_ds = EEGSegmentDataset(X, y, sid, test_idx)
+
+            train_loader = make_loader(
+                train_ds,
+                batch_size=int(cfg["batch_size"]),
+                shuffle=True,
+                num_workers=int(cfg["num_workers"]),
+                pin_memory=bool(cfg["pin_memory"]),
+            )
+            val_loader = make_loader(
+                val_ds,
+                batch_size=int(cfg["batch_size"]),
+                shuffle=False,
+                num_workers=int(cfg["num_workers"]),
+                pin_memory=bool(cfg["pin_memory"]),
+            )
+            test_loader = make_loader(
+                test_ds,
+                batch_size=int(cfg["batch_size"]),
+                shuffle=False,
+                num_workers=int(cfg["num_workers"]),
+                pin_memory=bool(cfg["pin_memory"]),
+            )
+
+            # model/trainer
+            model = build_model(cfg, enc_in=enc_in, seq_len=seq_len).to(device)
+            criterion = nn.CrossEntropyLoss()
+            optimizer = make_optimizer(cfg, model)
+            scheduler = make_scheduler(cfg, optimizer)
+
+            best_path = os.path.join(fold_dir, "best.pth")
+
+            fold_wandb = None
+            if wandb_run is not None:
+                try:
+                    import wandb
+                    fold_wandb = wandb_run  # 1 run chung; log kèm fold tag
+                    fold_wandb.log({"fold": fold_idx, "band": band})
+                except Exception:
+                    fold_wandb = None
+
+            trainer = Trainer(
+                model=model,
+                device=device,
+                criterion=criterion,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                amp=bool(cfg.get("amp", True)),
+                grad_clip_norm=float(cfg.get("grad_clip_norm", 0.0)),
+                early_stop=True,  # always True as requested
+                patience=int(cfg.get("patience", 12)),
+                min_delta=float(cfg.get("min_delta", 0.0)),
+                best_path=best_path,
+                wandb_run=fold_wandb,
+            )
+
+            fit_info = trainer.fit(train_loader, val_loader, epochs=int(cfg["epochs"]))
+
+            # save history + curves
+            save_json(os.path.join(fold_dir, "history.json"), fit_info)
+            plot_loss_curve(fit_info["history"], os.path.join(fold_dir, "loss_curve.png"))
+
+            # evaluate on test (segment-level)
+            y_true_seg, y_prob_seg, sid_seg = predict_probs(model, test_loader, device=device)
+            metrics_seg = compute_metrics(
+                y_true=y_true_seg,
+                y_prob=y_prob_seg,
+                threshold=float(cfg["threshold"]),
+                metrics=list(cfg["metrics"]),
+            )
+
+            # subject-level
+            y_true_sub, y_prob_sub, subj_ids = aggregate_subject(
+                y_true_seg, y_prob_seg, sid_seg,
+                agg=str(cfg.get("subject_agg", "mean_prob")),
+                threshold=float(cfg["threshold"]),
+            )
+            metrics_sub = compute_metrics(
+                y_true=y_true_sub,
+                y_prob=y_prob_sub,
+                threshold=float(cfg["threshold"]),
+                metrics=list(cfg["metrics"]),
+            )
+
+            # visualize confusion / roc
+            cm_seg = confusion_2x2(y_true_seg, (y_prob_seg >= float(cfg["threshold"])).astype(np.int64))
+            cm_sub = confusion_2x2(y_true_sub, (y_prob_sub >= float(cfg["threshold"])).astype(np.int64))
+            plot_confusion(cm_seg, os.path.join(fold_dir, "cm_segment.png"), "Confusion (segment)")
+            plot_confusion(cm_sub, os.path.join(fold_dir, "cm_subject.png"), "Confusion (subject)")
+
+            if "auc" in cfg["metrics"]:
+                plot_roc(y_true_seg, y_prob_seg, os.path.join(fold_dir, "roc_segment.png"), "ROC (segment)")
+                plot_roc(y_true_sub, y_prob_sub, os.path.join(fold_dir, "roc_subject.png"), "ROC (subject)")
+
+            # save raw preds (optional but useful)
+            save_npz(
+                os.path.join(fold_dir, "test_preds.npz"),
+                y_true_seg=y_true_seg,
+                y_prob_seg=y_prob_seg,
+                sid_seg=sid_seg,
+                y_true_sub=y_true_sub,
+                y_prob_sub=y_prob_sub,
+                subj_ids=subj_ids,
+            )
+
+            fold_pack = {
+                "band": band,
+                "fold": int(fold_idx),
+                "paths": {"npz": band_paths["npz"], "meta": band_paths["meta"]},
+                "counts": {
+                    "subjects_train": int(len(train_sub)),
+                    "subjects_val": int(len(val_sub)),
+                    "subjects_test": int(len(test_sub)),
+                    "segments_train": int(train_idx.size),
+                    "segments_val": int(val_idx.size),
+                    "segments_test": int(test_idx.size),
+                },
+                "best": {"epoch": fit_info["best_epoch"], "val_loss": fit_info["best_val_loss"], "best_path": best_path},
+                "metrics_segment": metrics_seg,
+                "metrics_subject": metrics_sub,
+            }
+            save_json(os.path.join(fold_dir, "metrics.json"), fold_pack)
+
+            fold_metrics_seg.append(metrics_seg)
+            fold_metrics_sub.append(metrics_sub)
+
+            if wandb_run is not None:
+                try:
+                    wandb_run.log(
+                        {f"{band}/fold{fold_idx}/seg_{k}": v for k, v in metrics_seg.items()}
+                        | {f"{band}/fold{fold_idx}/sub_{k}": v for k, v in metrics_sub.items()},
+                        step=int(fit_info["best_epoch"]),
                     )
-            else:
-                run_one(
-                    data_cfg=data_cfg,
-                    train_cfg=train_cfg,
-                    exp_cfg=exp_cfg,
-                    model_yaml_path=model_yaml_path,
-                    model_base_cfg=model_base_cfg,
-                    sidecar=sidecar,
-                    cache_dict=cache_dict,
-                    npz_path=npz_path,
-                    json_path=json_path,
-                    seed=int(seed),
-                    n_blocks_override=None,
-                )
+                except Exception:
+                    pass
+
+        # summary mean±std
+        def summarize(m_list: List[Dict[str, float]]) -> Dict[str, Any]:
+            out = {}
+            for m in cfg["metrics"]:
+                vals = np.array([d.get(m, float("nan")) for d in m_list], dtype=float)
+                out[m] = {
+                    "per_fold": [float(x) for x in vals.tolist()],
+                    "mean": float(np.nanmean(vals)),
+                    "std": float(np.nanstd(vals)),
+                }
+            return out
+
+        band_summary = {
+            "band": band,
+            "folds": int(cfg["folds"]),
+            "segment": summarize(fold_metrics_seg),
+            "subject": summarize(fold_metrics_sub),
+        }
+        save_json(os.path.join(band_dir, "summary.json"), band_summary)
+        all_band_summaries[band] = band_summary
+
+    save_json(os.path.join(root_run, "all_bands_summary.json"), all_band_summaries)
+
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cfg_data", default="configs/data.yaml")
-    ap.add_argument("--cfg_model", default="configs/model.yaml")
-    ap.add_argument("--cfg_models", nargs="*", default=None)  # NEW: many model yamls
-    ap.add_argument("--cfg_train", default="configs/train.yaml")
-    ap.add_argument("--cfg_exp", default="configs/experiment.yaml")
-    args = ap.parse_args()
-    main(args.cfg_data, args.cfg_model, args.cfg_train, args.cfg_exp, args.cfg_models)
+    main()

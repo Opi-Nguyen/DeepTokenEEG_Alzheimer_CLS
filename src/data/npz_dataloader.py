@@ -33,6 +33,7 @@ def load_band_npz(npz_path: str, band_name: str) -> BandCache:
     X = np.asarray(npz[X_key])
     y = np.asarray(npz["y"]).astype(np.int64)
 
+    
     sid_is_k = False
     if "k" in npz.files:
         sid = np.asarray(npz["k"])
@@ -46,6 +47,10 @@ def load_band_npz(npz_path: str, band_name: str) -> BandCache:
     else:
         sid = sid.astype(np.int64)
 
+    if X.ndim == 3:
+        # heuristic: if X is [N, T, C] with C small (<=64) -> transpose to [N, C, T]
+        if (X.shape[1] > X.shape[2]) and (X.shape[2] <= 64):
+            X = np.transpose(X, (0, 2, 1))  # [N, C, T]
     # X float32
     if X.dtype != np.float32:
         X = X.astype(np.float32, copy=False)

@@ -1,178 +1,162 @@
-# train/src_train/trainer.py
+# src/train/trainer_cv.py
+from __future__ import annotations
+
 import os
 import time
+from typing import Any, Dict, Optional
+
 import torch
-
-import yaml  # PyYAML
-
-
-def _unpack_batch(batch):
-    """
-    Support both:
-      (x, y, sid)
-      (x, y, sid, k)
-    """
-    if isinstance(batch, (list, tuple)):
-        if len(batch) == 3:
-            x, y, sid = batch
-            return x, y, sid
-        if len(batch) >= 4:
-            return batch[0], batch[1], batch[2]
-    raise ValueError(f"Unexpected batch format: type={type(batch)} len={len(batch) if isinstance(batch,(list,tuple)) else 'NA'}")
+import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
 
 
-def _makedirs_for_file(path: str):
-    if not path:
-        return
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
+def _ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
 
-def _get_lr(optimizer):
+def _get_lr(optim: torch.optim.Optimizer) -> float:
     try:
-        return float(optimizer.param_groups[0].get("lr", 0.0))
+        return float(optim.param_groups[0].get("lr", 0.0))
     except Exception:
-        return None
+        return 0.0
 
 
-def _dump_yaml(path: str, payload: dict):
-    _makedirs_for_file(path)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+class Trainer:
+    """
+    Trainer for ONE (train_loader, val_loader). Test handled outside.
+    Always early stopping = True (as requested).
+    """
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        device: torch.device,
+        criterion: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Optional[Any],
+        amp: bool,
+        grad_clip_norm: float,
+        early_stop: bool,
+        patience: int,
+        min_delta: float,
+        best_path: str,
+        wandb_run: Optional[Any] = None,
+    ):
+        self.model = model
+        self.device = device
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.amp = bool(amp) and (str(device).startswith("cuda"))
+        self.scaler = GradScaler(enabled=self.amp)
+        self.grad_clip_norm = float(grad_clip_norm) if grad_clip_norm is not None else 0.0
 
+        self.early_stop = True if early_stop is None else bool(early_stop)
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
 
-def train_model(
-    model,
-    train_loader,
-    val_loader,
-    criterion,
-    optimizer,
-    scheduler=None,
-    device="cpu",
-    epochs=50,
-    patience=10,
-    best_model_path="best.pth",
-    log_yaml_path=None,            # NEW
-    run_info: dict | None = None,  # NEW: nhét thêm config/meta nếu muốn
-    write_yaml_every_epoch=True,   # NEW
-):
-    best_val_loss = float("inf")
-    best_epoch = -1
-    patience_ctr = 0
+        self.best_path = best_path
+        _ensure_dir(os.path.dirname(best_path))
 
-    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    history = []
+        self.wandb_run = wandb_run
+        self.history = []
 
-    _makedirs_for_file(best_model_path)
-    if log_yaml_path:
-        _makedirs_for_file(log_yaml_path)
+        self.best_val = float("inf")
+        self.best_epoch = -1
 
-    def write_yaml(final=False):
-        if not log_yaml_path:
-            return
-        payload = {
-            "started_at": started_at,
-            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S") if final else None,
-            "device": str(device),
-            "epochs_planned": int(epochs),
-            "patience": int(patience),
-            "best_model_path": str(best_model_path),
-            "best_epoch": int(best_epoch),
-            "best_val_loss": float(best_val_loss) if best_val_loss != float("inf") else None,
-            "run_info": run_info or {},
-            "history": history,
-        }
-        _dump_yaml(log_yaml_path, payload)
+    def _step_loader(self, loader, train: bool) -> float:
+        if train:
+            self.model.train()
+        else:
+            self.model.eval()
 
-    for epoch in range(1, epochs + 1):
-        # -------- train --------
-        model.train()
-        train_loss_sum = 0.0
-        n_train = 0
+        loss_sum = 0.0
+        n = 0
 
-        for batch in train_loader:
-            x, y, _sid = _unpack_batch(batch)
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+        for batch in loader:
+            x, y, _sid = batch
+            x = x.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
+            if train:
+                self.optimizer.zero_grad(set_to_none=True)
+
+            with autocast(enabled=self.amp):
+                logits = self.model(x)
+                loss = self.criterion(logits, y)
+
+            if train:
+                self.scaler.scale(loss).backward()
+                if self.grad_clip_norm and self.grad_clip_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
             bs = int(y.size(0))
-            train_loss_sum += float(loss.item()) * bs
-            n_train += bs
+            loss_sum += float(loss.item()) * bs
+            n += bs
 
-        train_loss = train_loss_sum / max(n_train, 1)
+        return loss_sum / max(n, 1)
 
-        # -------- val --------
-        model.eval()
-        val_loss_sum = 0.0
-        n_val = 0
+    def fit(self, train_loader, val_loader, epochs: int) -> Dict[str, Any]:
+        started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        patience_ctr = 0
 
-        with torch.no_grad():
-            for batch in val_loader:
-                x, y, _sid = _unpack_batch(batch)
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
+        for epoch in range(1, int(epochs) + 1):
+            train_loss = self._step_loader(train_loader, train=True)
+            with torch.no_grad():
+                val_loss = self._step_loader(val_loader, train=False)
 
-                logits = model(x)
-                loss = criterion(logits, y)
+            # scheduler
+            if self.scheduler is not None:
+                try:
+                    # ReduceLROnPlateau
+                    self.scheduler.step(val_loss)
+                except TypeError:
+                    self.scheduler.step()
 
-                bs = int(y.size(0))
-                val_loss_sum += float(loss.item()) * bs
-                n_val += bs
+            lr_now = _get_lr(self.optimizer)
 
-        val_loss = val_loss_sum / max(n_val, 1)
+            improved = (self.best_val - val_loss) > self.min_delta
+            if improved:
+                self.best_val = float(val_loss)
+                self.best_epoch = int(epoch)
+                patience_ctr = 0
+                torch.save(self.model.state_dict(), self.best_path)
+            else:
+                patience_ctr += 1
 
-        # scheduler
-        if scheduler is not None:
-            try:
-                scheduler.step(val_loss)  # ReduceLROnPlateau
-            except TypeError:
-                scheduler.step()
+            row = {
+                "epoch": int(epoch),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "lr": float(lr_now),
+                "improved": bool(improved),
+                "patience_ctr": int(patience_ctr),
+            }
+            self.history.append(row)
 
-        lr_now = _get_lr(optimizer)
+            if self.wandb_run is not None:
+                self.wandb_run.log(row, step=epoch)
 
-        improved = val_loss < best_val_loss
-        if improved:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            patience_ctr = 0
-            torch.save(model.state_dict(), best_model_path)
-        else:
-            patience_ctr += 1
+            print(
+                f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} "
+                f"| lr={lr_now:.6g} | best={self.best_val:.6f} @ {self.best_epoch}"
+            )
 
-        history.append({
-            "epoch": int(epoch),
-            "train_loss": float(train_loss),
-            "val_loss": float(val_loss),
-            "lr": lr_now,
-            "improved": bool(improved),
-            "patience_ctr": int(patience_ctr),
-        })
+            if self.early_stop and patience_ctr >= self.patience:
+                break
 
-        if log_yaml_path and write_yaml_every_epoch:
-            write_yaml(final=False)
+        # restore best
+        if os.path.exists(self.best_path):
+            self.model.load_state_dict(torch.load(self.best_path, map_location=self.device))
 
-        print(
-            f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} "
-            f"| lr={lr_now} | best={best_val_loss:.6f} @ {best_epoch}"
-        )
-
-        if patience_ctr >= patience:
-            break
-
-    # load best back
-    if best_model_path and os.path.exists(best_model_path):
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
-
-    if log_yaml_path and (not write_yaml_every_epoch):
-        write_yaml(final=True)
-    elif log_yaml_path and write_yaml_every_epoch:
-        write_yaml(final=True)
-
-    return model, float(best_val_loss)
+        finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "best_val_loss": float(self.best_val),
+            "best_epoch": int(self.best_epoch),
+            "best_path": self.best_path,
+            "history": self.history,
+        }
