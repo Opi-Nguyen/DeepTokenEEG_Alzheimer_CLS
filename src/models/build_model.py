@@ -38,4 +38,8 @@ def build_model(cfg: Dict[str, Any], enc_in: int, seq_len: int) -> nn.Module:
         from src.models.BIOT import Model
         return Model(cfg=cfg, enc_in=int(enc_in), seq_len=int(seq_len))
 
+    if name == "Transformer":
+        from src.models.Transformer import Model
+        return Model(cfg=cfg, enc_in=int(enc_in), seq_len=int(seq_len))
+
     raise ValueError(f"Unknown model_name={name}")

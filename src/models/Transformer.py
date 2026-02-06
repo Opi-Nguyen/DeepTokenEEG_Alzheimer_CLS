@@ -1,112 +1,105 @@
+# src/models/Transformer.py
+from __future__ import annotations
+from typing import Any, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.Transformer_EncDec import (
-    Encoder,
-    EncoderLayer,
-)
-from layers.SelfAttention_Family import FullAttention, AttentionLayer
-from layers.Embed import DataEmbedding
-import numpy as np
-import random
-from layers.Augmentation import get_augmentation
+
+from src.models.layers.Embed import DataEmbedding
+from src.models.layers.Transformer_EncDec import Encoder, EncoderLayer
+from src.models.layers.SelfAttention_Family import FullAttention, AttentionLayer
 
 
 class Model(nn.Module):
     """
-    Vanilla Transformer
-    with O(L^2) complexity
-    Paper link: https://proceedings.neurips.cc/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf
+    Transformer (supervised-only, pipeline-compatible)
+    Input : x [B, C, T] or [B, T, C]
+    Output: logits [B, num_class]
     """
+    def __init__(self, cfg=None, enc_in: int = None, seq_len: int = None, configs=None, **kwargs):
+        super().__init__()
+        if cfg is None:
+            cfg = configs
+        if cfg is None:
+            raise ValueError("Transformer requires cfg/configs")
 
-    def __init__(self, configs):
-        super(Model, self).__init__()
-        self.task_name = configs.task_name
-        self.output_attention = configs.output_attention
-        augmentations = configs.augmentations.split(",")
-        # augmentations are necessary for contrastive pretraining
-        if augmentations == ["none"] and "pretrain" in self.task_name:
-            augmentations = ["flip", "frequency", "jitter", "mask", "channel", "drop"]
+        # cfg object -> dict
+        if not hasattr(cfg, "get"):
+            cfg = vars(cfg)
 
-        self.augmentation = nn.ModuleList(
-            [get_augmentation(aug) for aug in augmentations]
-        )
-        # Embedding
+        self.enc_in = int(enc_in)
+        self.seq_len = int(seq_len)
+        self.num_class = int(cfg["num_class"])
+
+        d_model = int(cfg.get("d_model", 128))
+        dropout = float(cfg.get("dropout", 0.1))
+        n_heads = int(cfg.get("n_heads", 4))
+        d_ff = int(cfg.get("d_ff", 256))
+        e_layers = int(cfg.get("e_layers", 2))
+        factor = int(cfg.get("factor", 1))
+        activation = str(cfg.get("activation", "gelu"))
+        self.output_attention = bool(cfg.get("output_attention", False))
+
+        embed_type = str(cfg.get("embed_type", "fixed"))
+        freq = str(cfg.get("freq", "h"))  # không dùng nếu x_mark=None
+
+        # DataEmbedding expects x: [B, T, C]
         self.enc_embedding = DataEmbedding(
-            configs.enc_in,
-            configs.d_model,
-            configs.embed,
-            configs.freq,
-            configs.dropout,
+            c_in=self.enc_in,
+            d_model=d_model,
+            embed_type=embed_type,
+            freq=freq,
+            dropout=dropout,
         )
-        # Encoder
+
         self.encoder = Encoder(
             [
                 EncoderLayer(
                     AttentionLayer(
                         FullAttention(
                             False,
-                            configs.factor,
-                            attention_dropout=configs.dropout,
-                            output_attention=configs.output_attention,
+                            factor,
+                            attention_dropout=dropout,
+                            output_attention=self.output_attention,
                         ),
-                        configs.d_model,
-                        configs.n_heads,
+                        d_model,
+                        n_heads,
                     ),
-                    configs.d_model,
-                    configs.d_ff,
-                    dropout=configs.dropout,
-                    activation=configs.activation,
+                    d_model,
+                    d_ff,
+                    dropout=dropout,
+                    activation=activation,
                 )
-                for l in range(configs.e_layers)
+                for _ in range(e_layers)
             ],
-            norm_layer=torch.nn.LayerNorm(configs.d_model),
+            norm_layer=nn.LayerNorm(d_model),
         )
 
-        # Decoder
-        self.act = F.gelu
-        self.dropout = nn.Dropout(configs.dropout)
-        if self.task_name == "supervised" or self.task_name == "finetune":
-            self.projection = nn.Linear(
-                configs.d_model * configs.seq_len, configs.num_class
-            )
+        self.act = F.gelu if activation.lower() == "gelu" else F.relu
+        self.drop = nn.Dropout(dropout)
+        self.projection = nn.Linear(d_model, self.num_class)
 
-    def supervised(self, x_enc, x_mark_enc):
-        # Embedding
-        enc_out = self.enc_embedding(x_enc, None)
-        enc_out, attns = self.encoder(enc_out, attn_mask=None)
+    def _to_BTC(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError(f"Transformer expects 3D tensor, got {tuple(x.shape)}")
 
-        # Output
-        output = self.act(
-            enc_out
-        )  # the output transformer encoder/decoder embeddings don't include non-linearity
-        output = self.dropout(output)
-        output = output.reshape(
-            output.shape[0], -1
-        )  # (batch_size, seq_length * d_model)
-        output = self.projection(output)  # (batch_size, num_classes)
-        return output
+        # [B, T, C]
+        if x.shape[-1] == self.enc_in:
+            return x
 
-    def pretrain(self, x_enc, x_mark_enc):  # x_enc (batch_size, seq_length, enc_in)
-        # Data augmentation
-        x_enc = x_enc.permute(0, 2, 1)  # (batch_size, enc_in, seq_len)
-        aug_idx = random.randint(0, len(self.augmentation) - 1)
-        x_enc = self.augmentation[aug_idx](x_enc)
-        x_enc = x_enc.permute(0, 2, 1)  # (batch_size, seq_len, enc_in)
-        # Embedding
-        enc_out = self.enc_embedding(x_enc, None)
-        enc_out, attns = self.encoder(enc_out, attn_mask=None)
+        # [B, C, T] -> [B, T, C]
+        if x.shape[1] == self.enc_in:
+            return x.transpose(1, 2).contiguous()
 
-        # Pooling
-        repr_out = enc_out.mean(dim=1).reshape(enc_out.shape[0], -1)
-        return enc_out, repr_out  # first for TS2Vec contrastive pretraining, second for linear probing
+        raise ValueError(f"Channel mismatch: enc_in={self.enc_in}, got {tuple(x.shape)}")
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name == "supervised" or self.task_name == "finetune":
-            dec_out = self.supervised(x_enc, x_mark_enc)
-            return dec_out  # [B, N]
-        elif self.task_name == "pretrain_ts2vec":
-            repr_h, repr_z = self.pretrain(x_enc, x_mark_enc)
-            return repr_h, repr_z
-        else:
-            raise ValueError("Task name not recognized or not implemented within the Transformer model")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_tc = self._to_BTC(x)                      # [B, T, C]
+        enc_out = self.enc_embedding(x_tc, None)    # [B, T, d_model]
+        enc_out, _ = self.encoder(enc_out, attn_mask=None)
+
+        out = self.act(enc_out)
+        out = self.drop(out)
+        out = out.mean(dim=1)                       # [B, d_model]
+        return self.projection(out)                 # [B, num_class]
