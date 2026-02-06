@@ -1,38 +1,54 @@
+# src/models/EEG2Rep.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from layers.Transformer_EncDec import (
-    Encoder,
-    EncoderLayer,
-    Decoder,
-    DecoderLayer,
-)
-from models.layers.Embed import EEG2RepEmbedding, PositionalEmbedding
-from models.layers.SelfAttention_Family import FullAttention, AttentionLayer
-from layers.Embed import DataEmbedding
-import numpy as np
-from utils.tools import semantic_subsequence_preserving
-import copy
+
+from src.models.layers.Transformer_EncDec import Encoder, EncoderLayer
+from src.models.layers.SelfAttention_Family import FullAttention, AttentionLayer
+from src.models.layers.Embed import EEG2RepEmbedding, PositionalEmbedding
 
 
 class Model(nn.Module):
     """
-        EEG2Rep: https://github.com/Navidfoumani/EEG2Rep
+    EEG2Rep (supervised-only, pipeline-compatible)
+
+    Input:
+      - x: [B, C, T] (pipeline) or [B, T, C]
+    Output:
+      - logits: [B, num_class]
     """
 
-    def __init__(self, configs):
-        super(Model, self).__init__()
-        self.task_name = configs.task_name
-        self.output_attention = configs.output_attention
-        self.mask_ratio = configs.mask_ratio
-        pooling_size = 2
-        # Embedding
-        self.PositionalEncoding = PositionalEmbedding(configs.d_model)
+    def __init__(self, cfg, enc_in: int, seq_len: int):
+        super().__init__()
+
+        # cfg có thể là dict hoặc object
+        if not hasattr(cfg, "get"):
+            cfg = vars(cfg)
+
+        self.enc_in = int(enc_in)
+        self.seq_len = int(seq_len)
+
+        self.output_attention = bool(cfg.get("output_attention", False))
+        self.num_class = int(cfg["num_class"])
+
+        d_model = int(cfg.get("d_model", 128))
+        dropout = float(cfg.get("dropout", 0.1))
+        n_heads = int(cfg.get("n_heads", 4))
+        d_ff = int(cfg.get("d_ff", 256))
+        e_layers = int(cfg.get("e_layers", 2))
+        factor = int(cfg.get("factor", 1))
+        activation = str(cfg.get("activation", "gelu"))
+
+        pooling_size = int(cfg.get("pooling_size", 2))
+
+        # Embedding (EEG2RepEmbedding EXPECTS input [B, T, C])
+        self.pos_embed = PositionalEmbedding(d_model)
         self.enc_embedding = EEG2RepEmbedding(
-            configs.enc_in,
-            configs.d_model,
-            pooling_size,
+            c_in=self.enc_in,
+            d_model=d_model,
+            pooling_size=pooling_size,
         )
+
         # Encoder
         self.encoder = Encoder(
             [
@@ -40,95 +56,62 @@ class Model(nn.Module):
                     AttentionLayer(
                         FullAttention(
                             False,
-                            configs.factor,
-                            attention_dropout=configs.dropout,
-                            output_attention=configs.output_attention,
+                            factor,
+                            attention_dropout=dropout,
+                            output_attention=self.output_attention,
                         ),
-                        configs.d_model,
-                        configs.n_heads,
+                        d_model,
+                        n_heads,
                     ),
-                    configs.d_model,
-                    configs.d_ff,
-                    dropout=configs.dropout,
-                    activation=configs.activation,
+                    d_model,
+                    d_ff,
+                    dropout=dropout,
+                    activation=activation,
                 )
-                for l in range(configs.e_layers)
+                for _ in range(e_layers)
             ],
-            norm_layer=torch.nn.LayerNorm(configs.d_model),
+            norm_layer=nn.LayerNorm(d_model),
         )
 
-        self.norm = nn.LayerNorm(configs.d_model)
-        self.norm2 = nn.LayerNorm(configs.d_model)
-        # Decoder
-        if self.task_name == "supervised" or self.task_name == "finetune":
-            self.projection = nn.Linear(
-                configs.d_model,
-                configs.num_class
-            )
-        elif self.task_name == "pretrain_eeg2rep":
-            self.mask_token = nn.Parameter(torch.randn(configs.d_model, ))
-            # for cross attention
-            self.Predictor = Decoder(
-                [
-                    DecoderLayer(
-                        AttentionLayer(
-                            FullAttention(True, configs.factor, attention_dropout=configs.dropout,
-                                          output_attention=False),
-                            configs.d_model, configs.n_heads),
-                        AttentionLayer(
-                            FullAttention(False, configs.factor, attention_dropout=configs.dropout,
-                                          output_attention=False),
-                            configs.d_model, configs.n_heads),
-                        configs.d_model,
-                        configs.d_ff,
-                        dropout=configs.dropout,
-                        activation=configs.activation,
-                    )
-                    for l in range(configs.d_layers)
-                ],
-                norm_layer=torch.nn.LayerNorm(configs.d_model),
-            )
-            self.m_encoder = copy.deepcopy(self.encoder)  # same initialization as model
-            for param in self.m_encoder.parameters():
-                param.requires_grad = False
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
 
-    def pretrain(self, x_enc, x_mark_enc):  # x_enc (batch_size, seq_length, enc_in)
-        enc_out = self.enc_embedding(x_enc)
-        output = self.norm(enc_out)
-        output = output + self.PositionalEncoding(output)
-        output = self.norm2(output)
+        self.projection = nn.Linear(d_model, self.num_class)
 
-        rep_mask_token = self.mask_token.repeat(output.shape[0], output.shape[1], 1)
-        rep_mask_token = rep_mask_token + self.PositionalEncoding(rep_mask_token)
+    def _to_BTC(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Return x_tc: [B, T, C]
+        """
+        if x.dim() != 3:
+            raise ValueError(f"EEG2Rep expects 3D tensor, got {tuple(x.shape)}")
 
-        index = np.arange(output.shape[1])
-        index_chunk = semantic_subsequence_preserving(index, 2, self.mask_ratio)
-        v_index = np.ravel(index_chunk)  # visible patches index (may have repeated index)
-        m_index = np.setdiff1d(index, v_index)  # mask patches index
+        # already [B, T, C]
+        if x.shape[-1] == self.enc_in:
+            x_tc = x
+        # [B, C, T] -> [B, T, C]
+        elif x.shape[1] == self.enc_in:
+            x_tc = x.transpose(1, 2).contiguous()
+        else:
+            raise ValueError(f"Channel mismatch: enc_in={self.enc_in}, got {tuple(x.shape)}")
 
-        visible = output[:, v_index, :]
-        rep_mask_token = rep_mask_token[:, m_index, :]
-        rep_contex, _ = self.encoder(visible, attn_mask=None)
-        with torch.no_grad():
-            rep_target, _ = self.m_encoder(output, attn_mask=None)
-            rep_mask = rep_target[:, m_index, :]
-        rep_mask_prediction = self.Predictor(rep_mask_token, rep_contex)  # cross attention
-        return rep_mask, rep_mask_prediction
+        # enforce T == seq_len (ổn định)
+        T = int(x_tc.shape[1])
+        if T < self.seq_len:
+            x_tc = F.pad(x_tc, (0, 0, 0, self.seq_len - T), mode="replicate")
+        elif T > self.seq_len:
+            x_tc = x_tc[:, : self.seq_len, :].contiguous()
 
-    def supervised(self, x_enc, x_mark_enc):
-        # Embedding
-        enc_out = self.enc_embedding(x_enc)
-        output = self.norm(enc_out)
-        output = output + self.PositionalEncoding(output)
-        output = self.norm2(output)
-        output, attns = self.encoder(output, attn_mask=None)
-        return self.projection(torch.mean(output, dim=1))
+        return x_tc
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        if self.task_name == "supervised" or self.task_name == "finetune":
-            dec_out = self.supervised(x_enc, x_mark_enc)
-            return dec_out  # [B, N]
-        elif self.task_name == "pretrain_eeg2rep":
-            repr_m, repr_m_p = self.pretrain(x_enc, x_mark_enc)
-            return repr_m, repr_m_p
-        return None
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_tc = self._to_BTC(x)                 # [B, T, C]
+
+        enc_out = self.enc_embedding(x_tc)     # [B, T', d_model] (T' sau pooling)
+        out = self.norm1(enc_out)
+        out = out + self.pos_embed(out)
+        out = self.norm2(out)
+
+        out, _ = self.encoder(out, attn_mask=None)  # [B, T', d_model]
+
+        out = out.mean(dim=1)                   # [B, d_model]
+        return self.projection(out)             # [B, num_class]
