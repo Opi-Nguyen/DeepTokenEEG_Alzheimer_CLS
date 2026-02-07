@@ -223,24 +223,24 @@ def main():
 
     # wandb (optional)
     wandb_run = None
-    if cfg.get("wandb_mode", "online") != "disabled":
-        try:
-            import wandb
-            wandb_run = wandb.init(
-                project=cfg.get("wandb_project", "DeepTokenEEG"),
-                entity=cfg.get("wandb_entity", None),
-                name=f"{cfg['run_name']}",
-                config=cfg,
-                dir=root_run,
-                mode=cfg.get("wandb_mode", "online"),
-            )
-        except Exception as e:
-            print(f"[WARN] wandb init failed -> disabled. err={e}")
-            wandb_run = None
 
     all_band_summaries = {}
 
     for band in cfg["band_set"]:
+        if cfg.get("wandb_mode", "online") != "disabled":
+            try:
+                import wandb
+                wandb_run = wandb.init(
+                    project=cfg.get("wandb_project", "DeepTokenEEG"),
+                    entity=cfg.get("wandb_entity", None),
+                    name=f"{cfg['server']}_{cfg['model_name']}_{cfg['dataset']}_{band}",
+                    config=cfg,
+                    dir=root_run,
+                    mode=cfg.get("wandb_mode", "online"),
+                )
+            except Exception as e:
+                print(f"[WARN] wandb init failed -> disabled. err={e}")
+                wandb_run = None
         band_paths = resolve_band_paths(cfg, band)
         cache = load_band_npz(band_paths["npz"], band)
 

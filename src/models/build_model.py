@@ -53,5 +53,9 @@ def build_model(cfg: Dict[str, Any], enc_in: int, seq_len: int) -> nn.Module:
     if name == "LEAD":
         from src.models.LEAD import Model
         return Model(cfg=cfg, enc_in=int(enc_in), seq_len=int(seq_len))
+    
+    if name == "TCN":
+        from src.models.TCN import Model
+        return Model(cfg=cfg, enc_in=int(enc_in), seq_len=int(seq_len))
 
     raise ValueError(f"Unknown model_name={name}")

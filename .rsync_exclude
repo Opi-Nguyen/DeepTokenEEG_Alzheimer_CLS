@@ -1,0 +1,10 @@
+node_modules/
+.git/
+*.log
+
+*dataset/*
+*outputs/*
+*EEG_data/*
+*__pycache__/*
+*configs/*
+note.txt

@@ -3,13 +3,13 @@ data_root: "outputs/cache_unified"
 scope: "single"              # "single" | "multidataset"
 dataset: "AD-Audiotory"      # chỉ dùng khi scope=single
 band_set: ["delta","theta","alpha","beta","gamma","fullband"]
-
 # ===== OUTPUT / LOG =====
 outdir: "outputs/runs"
 run_name: "exp_alpha_single"
 save_resolved_config: true
 
 # ===== DEVICE / CUDA =====
+server: "wondertek"
 device: "cuda:0"             # "cpu" | "cuda:0" | ...
 amp: true
 cudnn_benchmark: true
@@ -27,7 +27,7 @@ split_seed: 45
 
 # ===== TRAINING =====
 model_name: "DeepTokenEEG"
-epochs: 5
+epochs: 80
 batch_size: 256
 lr: 0.001
 weight_decay: 0.0001
@@ -58,4 +58,4 @@ save_best_on: "subject_f1"   # tuỳ bạn
 
 "wandb_mode": "online"     # "online" | "offline" | "disabled"
 "wandb_project": "DeepTokenEEG"
-"wandb_entity": None
+"wandb_entity": "wonderx"
